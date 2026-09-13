@@ -11,6 +11,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
 )
 from pyrogram.enums import ParseMode
+from pyrogram.parser.html import HTML
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, RPCError, FloodWait
 
 import config
@@ -73,8 +74,21 @@ def build_post_keyboard(download_link: str, extra_buttons: List[Dict[str, str]] 
     return InlineKeyboardMarkup(rows)
 
 
+def extract_formatted_html(message: Message) -> str:
+    """يحول الرسالة الواردة (النص أو الشرح) بما فيها من تنسيقات وروابط جاهزة أرسلها تيليجرام إلى صيغة HTML."""
+    text = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities
+    if not entities:
+        return text
+    try:
+        return HTML.unparse(text, entities)
+    except Exception as e:
+        logger.error(f"Error unparsing HTML entities: {e}")
+        return text
+
+
 async def get_post_caption_with_signature(client: Client, chat_id: int, message_id: int) -> Optional[str]:
-    """يجلب النص الأصلي للمنشور ويدمج التوقيع أسفله كـ Markdown شاملاً التنسيقات (غمق، مائل، مشطوب، روابط متعددة)."""
+    """يجلب النص الأصلي للمنشور بصيغة HTML ويدمج التوقيع أسفله بنفس الصيغة والتنسيقات والروابط المضمنة."""
     custom_sig = db.get_post_signature_custom()
     old_text, old_url = db.get_post_signature()
 
@@ -82,17 +96,17 @@ async def get_post_caption_with_signature(client: Client, chat_id: int, message_
         return None  # لا يوجد توقيع مخزن
 
     if custom_sig:
-        signature_md = custom_sig
+        signature_html = custom_sig
     else:
-        signature_md = f"[{old_text}]({old_url})"
+        signature_html = f'<a href="{old_url}">{old_text}</a>'
 
     try:
         msg = await client.get_messages(chat_id, message_id)
-        original_text = msg.caption or msg.text or ""
-        if original_text:
-            return f"{original_text}\n\n{signature_md}"
+        original_html = extract_formatted_html(msg)
+        if original_html:
+            return f"{original_html}\n\n{signature_html}"
         else:
-            return signature_md
+            return signature_html
     except Exception as e:
         logger.error(f"Error fetching message for signature: {e}")
         return None
@@ -470,21 +484,28 @@ async def process_admin_state_input(client: Client, message: Message):
             reply_markup=buttons
         )
 
-    # 2. حالة إضافة توقيع المنشورات التفاعلي والمنسق
+    # 2. حالة إضافة توقيع المنشورات المباشر المنسق
     elif action == "waiting_signature_input":
-        text_input = message.text.strip() if message.text else ""
-        if not text_input:
-            await message.reply_text("❌ يرجى إرسال نص التوقيع.")
+        # استخراج HTML الكامل المنسق المباشر من الرسالة المنسقة التي أرسلها الأدمن من تيليجرام
+        formatted_html = extract_formatted_html(message)
+
+        if not formatted_html:
+            await message.reply_text("❌ لم يتم التعرف على النص!")
             return
 
-        db.set_post_signature_custom(text_input)
+        db.set_post_signature_custom(formatted_html)
         ADMIN_STATES.pop(user_id, None)
 
         await message.reply_text(
-            f"✅ **تم حفظ وتنسيق توقيع المنشورات بنجاح!**\n\n"
-            f"✍️ **معاينة التوقيع الحالية:**\n{text_input}\n\n"
-            "سيتم إدراج هذا التوقيع بجميع تنسيقاته وروابطه المتعددة تلقائياً أسفل كل منشور جديد.",
+            "✅ **تم حفظ وتعيين توقيع المنشورات بنجاح!**\n\n"
+            "✍️ **معاينة التوقيع المرسل تلقائياً:**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة لجهة التوقيع", callback_data="admin_signature")]])
+        )
+        await client.send_message(
+            chat_id=user_id,
+            text=formatted_html,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
         )
 
     # 3. حالة إضافة قناة اشتراك إجباري
@@ -624,7 +645,7 @@ async def preview_post_by_id(client: Client, user_id: int, post_id: int):
             from_chat_id=post_chat_id,
             message_id=post_message_id,
             caption=new_caption,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
             reply_markup=keyboard
         )
     else:
@@ -679,7 +700,7 @@ async def publish_post_by_id(client: Client, user_id: int, post_id: int):
                     from_chat_id=post_chat_id,
                     message_id=post_message_id,
                     caption=new_caption,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.HTML,
                     reply_markup=keyboard
                 )
             else:
@@ -788,7 +809,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
                 from_chat_id=post_chat_id,
                 message_id=post_msg_id,
                 caption=new_caption,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
                 reply_markup=keyboard
             )
         else:
@@ -844,16 +865,16 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
         old_text, old_url = db.get_post_signature()
 
         if custom_sig:
-            status_str = f"محدّد ✅\n\n✍️ **التوقيع الحالي:**\n{custom_sig}"
+            status_str = f"محدّد ✅"
         elif old_text and old_url:
-            status_str = f"محدّد ✅\n\n✍️ **التوقيع الحالي:** [{old_text}]({old_url})"
+            status_str = f"محدّد ✅\n\n✍️ **التوقيع الحالي:** <a href='{old_url}'>{old_text}</a>"
         else:
             status_str = "غير محدد ❌"
 
         text = (
-            "✍️ **إدارة توقيع المنشورات الشامل**\n\n"
-            "يمكنك كتابة توقيع كامل يدعم **الخط الغامق**، *المائل*، ~~المشطوب~~، وأكثر من جملة أو رابط بنفس الوقت!\n\n"
-            f"{status_str}"
+            "✍️ **إدارة توقيع المنشورات التلقائي**\n\n"
+            "يمكنك إرسال النص المنسق بالروابط والكلمات الجاهزة كما تجهزها في تيليجرام تماماً، وسيقوم البوت بالاحتفاظ بالروابط والكلمات المضمنة تلقائياً وإدراجها أسفل منشوراتك!\n\n"
+            f"حالة التوقيع: {status_str}"
         )
 
         buttons = [
@@ -863,7 +884,15 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
             buttons.append([InlineKeyboardButton("🗑 حذف التوقيع", callback_data="signature_delete")])
 
         buttons.append([InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="admin_panel")])
+
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        if custom_sig:
+            await client.send_message(
+                chat_id=user_id,
+                text=f"✍️ **معاينة التوقيع الحالي:**\n\n{custom_sig}",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
 
     elif data == "signature_set_prompt":
         ADMIN_STATES[user_id] = {"action": "waiting_signature_input"}
@@ -871,16 +900,10 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
             [InlineKeyboardButton("❌ إلغاء", callback_data="admin_signature")]
         ])
         help_text = (
-            "✍️ **تعيين توقيع المنشورات متعدد الجمل والروابط والتنسيقات:**\n\n"
-            "أرسل الآن التوقيع الذي تريد إظهاره أسفل المنشورات.\n"
-            "يمكنك استخدام التنسيقات المباشرة أو رموز Markdown:\n"
-            "• `**خط غامق**`\n"
-            "• `*خط مائل*`\n"
-            "• `~~خط مشطوب~~`\n"
-            "• `[اسم القناة الأولى](https://t.me/c1) | [الموقع الرسمي](https://site.com)`\n\n"
-            "مثال شامل:\n"
-            "**انضم لقنواتنا الرسمية:**\n"
-            "📢 [قناة التطبيقات](https://t.me/app_channel) | 🌐 [موقعنا](https://site.com)"
+            "✍️ **تعيين توقيع المنشورات بالروابط الجاهزة:**\n\n"
+            "💡 **طريقة السهلة والسريعة:**\n"
+            "قم بكتابة وتنسيق التوقيع في تيليجرام كالمعتاد (عبر تحديد الكلمة وربطها برابط أو جعلها غامقة) ثم أرسل الرسالة للبوت فوراً!\n"
+            "سيقوم البوت بالتقاط وتخزين النص المنسق وروابطه الجاهزة تلقائياً دون حاجتك لكتابة أية رموز!"
         )
         await callback.message.edit_text(help_text, reply_markup=buttons)
 
