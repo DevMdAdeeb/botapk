@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram File Store Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/filestore_bot
+ExecStart=/usr/bin/python3 /root/filestore_bot/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
