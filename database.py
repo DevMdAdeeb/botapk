@@ -60,6 +60,13 @@ def init_db():
             )
         """)
 
+        # جدول قنوات النشر العامة
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS public_channels (
+                channel TEXT PRIMARY KEY
+            )
+        """)
+
         # تعيين القيم الافتراضية
         conn.execute("""
             INSERT OR IGNORE INTO settings (key, value) VALUES ('force_sub_enabled', '0')
@@ -209,5 +216,33 @@ def remove_force_sub_channel(channel: str) -> bool:
     """يحذف قناة من الاشتراك الإجباري."""
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM force_sub_channels WHERE channel = ?", (channel.strip(),))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# ---------- قنوات النشر العامة ----------
+
+def get_public_channels() -> List[str]:
+    """يرجع قائمة بقنوات النشر العامة."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT channel FROM public_channels").fetchall()
+        return [row[0] for row in rows]
+
+
+def add_public_channel(channel: str) -> bool:
+    """يضيف قناة جديدة لقنوات النشر العامة."""
+    with get_conn() as conn:
+        try:
+            conn.execute("INSERT INTO public_channels (channel) VALUES (?)", (channel.strip(),))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_public_channel(channel: str) -> bool:
+    """يحذف قناة من قنوات النشر العامة."""
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM public_channels WHERE channel = ?", (channel.strip(),))
         conn.commit()
         return cur.rowcount > 0
