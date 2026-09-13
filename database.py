@@ -85,6 +85,9 @@ def init_db():
             INSERT OR IGNORE INTO settings (key, value) VALUES ('force_sub_enabled', '0')
         """)
         conn.execute("""
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('post_signature_custom', '')
+        """)
+        conn.execute("""
             INSERT OR IGNORE INTO settings (key, value) VALUES ('post_signature_text', '')
         """)
         conn.execute("""
@@ -267,10 +270,24 @@ def set_post_signature(text: str, url: str):
         conn.commit()
 
 
+def get_post_signature_custom() -> str:
+    """يرجع النص المنسق للتوقيع التفاعلي المخصص أو نص فارغ."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'post_signature_custom'").fetchone()
+        return row[0] if row and row[0] else ""
+
+
+def set_post_signature_custom(signature_text: str):
+    """يحدد النص التفاعلي/المنسق للتوقيع الشامل."""
+    with get_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('post_signature_custom', ?)", (signature_text.strip(),))
+        conn.commit()
+
+
 def delete_post_signature():
     """يحذف توقيع المنشورات."""
     with get_conn() as conn:
-        conn.execute("UPDATE settings SET value = '' WHERE key IN ('post_signature_text', 'post_signature_url')")
+        conn.execute("UPDATE settings SET value = '' WHERE key IN ('post_signature_custom', 'post_signature_text', 'post_signature_url')")
         conn.commit()
 
 

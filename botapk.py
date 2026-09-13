@@ -10,6 +10,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from pyrogram.enums import ParseMode
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, RPCError, FloodWait
 
 import config
@@ -73,15 +74,21 @@ def build_post_keyboard(download_link: str, extra_buttons: List[Dict[str, str]] 
 
 
 async def get_post_caption_with_signature(client: Client, chat_id: int, message_id: int) -> Optional[str]:
-    """يجلب النص الأصلي للمنشور ويدمج التوقيع أسفله كـ Markdown إن وجد توقيع مخزن."""
-    sig_text, sig_url = db.get_post_signature()
-    if not sig_text or not sig_url:
-        return None  # لا يوجد توقيع، احتفظ بالرسالة كما هي
+    """يجلب النص الأصلي للمنشور ويدمج التوقيع أسفله كـ Markdown شاملاً التنسيقات (غمق، مائل، مشطوب، روابط متعددة)."""
+    custom_sig = db.get_post_signature_custom()
+    old_text, old_url = db.get_post_signature()
+
+    if not custom_sig and (not old_text or not old_url):
+        return None  # لا يوجد توقيع مخزن
+
+    if custom_sig:
+        signature_md = custom_sig
+    else:
+        signature_md = f"[{old_text}]({old_url})"
 
     try:
         msg = await client.get_messages(chat_id, message_id)
         original_text = msg.caption or msg.text or ""
-        signature_md = f"[{sig_text}]({sig_url})"
         if original_text:
             return f"{original_text}\n\n{signature_md}"
         else:
@@ -463,28 +470,20 @@ async def process_admin_state_input(client: Client, message: Message):
             reply_markup=buttons
         )
 
-    # 2. حالة إضافة توقيع المنشورات
+    # 2. حالة إضافة توقيع المنشورات التفاعلي والمنسق
     elif action == "waiting_signature_input":
         text_input = message.text.strip() if message.text else ""
-        if "-" not in text_input or not ("http://" in text_input or "https://" in text_input):
-            await message.reply_text(
-                "❌ صيغة غير صحيحة! يرجى إرسال التوقيع بالشكل التالي:\n"
-                "`نص التوقيع - https://t.me/mychannel`"
-            )
+        if not text_input:
+            await message.reply_text("❌ يرجى إرسال نص التوقيع.")
             return
 
-        parts = text_input.split("-", 1)
-        sig_text = parts[0].strip()
-        sig_url = parts[1].strip()
-
-        db.set_post_signature(sig_text, sig_url)
+        db.set_post_signature_custom(text_input)
         ADMIN_STATES.pop(user_id, None)
 
         await message.reply_text(
-            f"✅ **تم تعيين توقيع المنشورات بنجاح!**\n\n"
-            f"✍️ النص: `{sig_text}`\n"
-            f"🔗 الرابط: `{sig_url}`\n\n"
-            "سيتم دمج هذا التوقيع تلقائياً أسفل كل منشور جديد.",
+            f"✅ **تم حفظ وتنسيق توقيع المنشورات بنجاح!**\n\n"
+            f"✍️ **معاينة التوقيع الحالية:**\n{text_input}\n\n"
+            "سيتم إدراج هذا التوقيع بجميع تنسيقاته وروابطه المتعددة تلقائياً أسفل كل منشور جديد.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة لجهة التوقيع", callback_data="admin_signature")]])
         )
 
@@ -625,6 +624,7 @@ async def preview_post_by_id(client: Client, user_id: int, post_id: int):
             from_chat_id=post_chat_id,
             message_id=post_message_id,
             caption=new_caption,
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard
         )
     else:
@@ -679,6 +679,7 @@ async def publish_post_by_id(client: Client, user_id: int, post_id: int):
                     from_chat_id=post_chat_id,
                     message_id=post_message_id,
                     caption=new_caption,
+                    parse_mode=ParseMode.MARKDOWN,
                     reply_markup=keyboard
                 )
             else:
@@ -787,6 +788,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
                 from_chat_id=post_chat_id,
                 message_id=post_msg_id,
                 caption=new_caption,
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard
             )
         else:
@@ -838,22 +840,26 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
 
     # 3. إدارة توقيع المنشورات
     elif data == "admin_signature":
-        sig_text, sig_url = db.get_post_signature()
-        if sig_text and sig_url:
-            status_str = f"محدّد ✅\n\n✍️ النص: [{sig_text}]({sig_url})\n🔗 الرابط: `{sig_url}`"
+        custom_sig = db.get_post_signature_custom()
+        old_text, old_url = db.get_post_signature()
+
+        if custom_sig:
+            status_str = f"محدّد ✅\n\n✍️ **التوقيع الحالي:**\n{custom_sig}"
+        elif old_text and old_url:
+            status_str = f"محدّد ✅\n\n✍️ **التوقيع الحالي:** [{old_text}]({old_url})"
         else:
             status_str = "غير محدد ❌"
 
         text = (
-            "✍️ **إدارة توقيع المنشورات**\n\n"
-            "عند تحديد توقيع، يتم إدماجه تلقائياً أسفل كل منشور على شكل نص يضم رابطاً.\n\n"
-            f"التوقيع الحالي:\n{status_str}"
+            "✍️ **إدارة توقيع المنشورات الشامل**\n\n"
+            "يمكنك كتابة توقيع كامل يدعم **الخط الغامق**، *المائل*، ~~المشطوب~~، وأكثر من جملة أو رابط بنفس الوقت!\n\n"
+            f"{status_str}"
         )
 
         buttons = [
             [InlineKeyboardButton("✏️ تعيين / تعديل التوقيع", callback_data="signature_set_prompt")],
         ]
-        if sig_text or sig_url:
+        if custom_sig or old_text:
             buttons.append([InlineKeyboardButton("🗑 حذف التوقيع", callback_data="signature_delete")])
 
         buttons.append([InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="admin_panel")])
@@ -864,12 +870,19 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
         buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ إلغاء", callback_data="admin_signature")]
         ])
-        await callback.message.edit_text(
-            "✍️ **تعيين توقيع المنشورات:**\n\n"
-            "أرسل نص التوقيع ورابطه مفصولين بشرطة `-` بالشكل التالي:\n"
-            "`قناتنا الرسمية - https://t.me/mychannel`",
-            reply_markup=buttons
+        help_text = (
+            "✍️ **تعيين توقيع المنشورات متعدد الجمل والروابط والتنسيقات:**\n\n"
+            "أرسل الآن التوقيع الذي تريد إظهاره أسفل المنشورات.\n"
+            "يمكنك استخدام التنسيقات المباشرة أو رموز Markdown:\n"
+            "• `**خط غامق**`\n"
+            "• `*خط مائل*`\n"
+            "• `~~خط مشطوب~~`\n"
+            "• `[اسم القناة الأولى](https://t.me/c1) | [الموقع الرسمي](https://site.com)`\n\n"
+            "مثال شامل:\n"
+            "**انضم لقنواتنا الرسمية:**\n"
+            "📢 [قناة التطبيقات](https://t.me/app_channel) | 🌐 [موقعنا](https://site.com)"
         )
+        await callback.message.edit_text(help_text, reply_markup=buttons)
 
     elif data == "signature_delete":
         db.delete_post_signature()
