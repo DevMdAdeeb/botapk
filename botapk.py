@@ -1,7 +1,7 @@
 import logging
 import asyncio
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -44,6 +44,18 @@ def is_admin(user_id: int) -> bool:
 
 def make_link(file_id: int) -> str:
     return f"https://t.me/{config.BOT_USERNAME}?start=file_{file_id}"
+
+
+def sanitize_channel_input(input_str: str) -> str:
+    """تنظيف مدخلات اسم القناة وتحويل الروابط إلى يوزرنيم أو آيدي رقمي صريح."""
+    cleaned = input_str.strip()
+    if cleaned.startswith("https://t.me/") or cleaned.startswith("http://t.me/"):
+        cleaned = cleaned.rstrip("/").split("/")[-1]
+        if not cleaned.startswith("@") and not cleaned.startswith("-100") and not cleaned.isdigit():
+            cleaned = f"@{cleaned}"
+    elif not cleaned.startswith("@") and not cleaned.startswith("-100") and not cleaned.isdigit():
+        cleaned = f"@{cleaned}"
+    return cleaned
 
 
 def build_post_keyboard(download_link: str, extra_buttons: List[Dict[str, str]] = None) -> InlineKeyboardMarkup:
@@ -103,7 +115,7 @@ async def start_handler(client: Client, message: Message):
 
     args = message.command
 
-    # دخول عبر رابط ملف
+    # 1. دخول عبر رابط ملف
     if len(args) >= 2 and args[1].startswith("file_"):
         param = args[1]
         try:
@@ -115,7 +127,7 @@ async def start_handler(client: Client, message: Message):
         await deliver_file(client, user_id, file_id, message)
         return
 
-    # دخول عادي بدون رابط ملف
+    # 2. دخول أدمن عادي بدون رابط ملف
     if is_admin(user_id):
         buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎛 فتح لوحة التحكم", callback_data="admin_panel")]
@@ -125,11 +137,28 @@ async def start_handler(client: Client, message: Message):
             "اضغط على الزر أدناه للوصول إلى لوحة التحكم الشفافة.",
             reply_markup=buttons
         )
-    else:
-        await message.reply_text(
-            "أهلاً بك! 👋\n"
-            "أرسل لك البرنامج المطلوب فور توفر رابط مباشر له من القناة."
-        )
+        return
+
+    # 3. دخول مستخدم عادي (بدون رابط ملف)
+    # تحقق من الاشتراك الإجباري أولاً
+    if db.is_force_sub_enabled():
+        channels = db.get_force_sub_channels()
+        if channels:
+            unsubscribed_channels = []
+            for ch in channels:
+                subscribed = await check_subscription(client, user_id, ch)
+                if not subscribed:
+                    unsubscribed_channels.append(ch)
+
+            if unsubscribed_channels:
+                await ask_to_subscribe(client, user_id, unsubscribed_channels, file_id=0)
+                return
+
+    # إذا كان مشتركاً أو الاشتراك غير مفعل
+    await message.reply_text(
+        "أهلاً بك! 👋\n"
+        "أرسل لك البرنامج المطلوب فور توفر رابط مباشر له من القناة."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +201,7 @@ async def deliver_file(client: Client, chat_id: int, file_id: int, trigger_messa
 
 async def check_subscription(client: Client, user_id: int, channel: str) -> bool:
     try:
-        ch_target = int(channel) if (channel.startswith("-100") or channel.isdigit()) else channel
+        ch_target = int(channel) if (str(channel).startswith("-100") or str(channel).isdigit()) else channel
         member = await client.get_chat_member(ch_target, user_id)
         return member.status not in ("left", "kicked", "banned")
     except UserNotParticipant:
@@ -185,28 +214,44 @@ async def check_subscription(client: Client, user_id: int, channel: str) -> bool
         return True
 
 
+async def get_channel_link(client: Client, channel: str) -> Optional[str]:
+    """يجلب رابط القناة تلقائياً سواء كانت يوزر أو آيدي رقمي."""
+    try:
+        ch_target = int(channel) if (str(channel).startswith("-100") or str(channel).isdigit()) else channel
+        chat = await client.get_chat(ch_target)
+        if chat.username:
+            return f"https://t.me/{chat.username}"
+        elif chat.invite_link:
+            return chat.invite_link
+        else:
+            try:
+                invite = await client.export_chat_invite_link(ch_target)
+                return invite
+            except Exception:
+                return None
+    except Exception as e:
+        logger.error(f"Error getting chat link for {channel}: {e}")
+        if str(channel).startswith("@"):
+            return f"https://t.me/{channel.lstrip('@')}"
+        elif str(channel).startswith("http://") or str(channel).startswith("https://"):
+            return channel
+        return None
+
+
 async def ask_to_subscribe(client: Client, chat_id: int, channels: list, file_id: int):
     buttons = []
     for idx, ch in enumerate(channels, 1):
-        if ch.startswith("http://") or ch.startswith("https://"):
-            display_link = ch
-        elif ch.startswith("@"):
-            display_link = f"https://t.me/{ch.lstrip('@')}"
-        elif not ch.startswith("-100"):
-            display_link = f"https://t.me/{ch}"
-        else:
-            display_link = None
-
-        if display_link:
-            buttons.append([InlineKeyboardButton(f"📢 اشترك في القناة ({idx})", url=display_link)])
+        link = await get_channel_link(client, ch)
+        if link:
+            buttons.append([InlineKeyboardButton(f"📢 اشترك في القناة ({idx})", url=link)])
 
     buttons.append(
-        [InlineKeyboardButton("✅ تحققت، أعطني الملف", callback_data=f"check_sub:{file_id}")]
+        [InlineKeyboardButton("✅ تحققت من الاشتراك", callback_data=f"check_sub:{file_id}")]
     )
 
     await client.send_message(
         chat_id,
-        "⚠️ يجب عليك الاشتراك في القنوات التالية أولًا لاستلام الملف:",
+        "⚠️ **عذراً، يجب عليك الاشتراك في القنوات التالية أولاً لاستخدام البوت:**",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -218,7 +263,10 @@ async def check_sub_callback(client: Client, callback: CallbackQuery):
 
     if not db.is_force_sub_enabled():
         await callback.message.delete()
-        await deliver_file(client, user_id, file_id, callback.message)
+        if file_id > 0:
+            await deliver_file(client, user_id, file_id, callback.message)
+        else:
+            await callback.message.reply_text("أهلاً بك! 👋\nأرسل لك البرنامج المطلوب فور توفر رابط مباشر له من القناة.")
         return
 
     channels = db.get_force_sub_channels()
@@ -230,7 +278,10 @@ async def check_sub_callback(client: Client, callback: CallbackQuery):
     if not unsubscribed:
         await callback.answer("تم التحقق بنجاح ✅")
         await callback.message.delete()
-        await deliver_file(client, user_id, file_id, callback.message)
+        if file_id > 0:
+            await deliver_file(client, user_id, file_id, callback.message)
+        else:
+            await callback.message.reply_text("أهلاً بك! 👋\nأرسل لك البرنامج المطلوب فور توفر رابط مباشر له من القناة.")
     else:
         await callback.answer("❌ لم يتم رصد اشتراكك في جميع القنوات بعد!", show_alert=True)
 
@@ -392,17 +443,31 @@ async def process_admin_state_input(client: Client, message: Message):
 
     # 2. حالة إضافة قناة اشتراك إجباري
     elif action == "waiting_add_channel":
-        channel_text = message.text.strip() if message.text else ""
-        if not channel_text:
+        raw_text = message.text.strip() if message.text else ""
+        if not raw_text:
             await message.reply_text("❌ يرجى إرسال يوزر القناة (مثال: `@mychannel`) أو رابطها أو آيدي القناة.")
             return
+
+        channel_text = sanitize_channel_input(raw_text)
+
+        # فحص إمكانية الوصول للقناة والتأكد إن كان البوت أدمن فيها
+        try:
+            ch_target = int(channel_text) if (channel_text.startswith("-100") or channel_text.isdigit()) else channel_text
+            chat = await client.get_chat(ch_target)
+            member = await client.get_chat_member(chat.id, "me")
+            if member.status not in ("administrator", "creator"):
+                warning_msg = "\n\n⚠️ **تنبيه هام:** البوت ليس أدمن في هذه القناة! يرجى رفع البوت أدمن في القناة ليتمكن من التحقق من اشتراكات المستخدمين."
+            else:
+                warning_msg = ""
+        except Exception:
+            warning_msg = "\n\n⚠️ **تنبيه:** تعذر التحقق التلقائي من القناة حالياً، تأكد من رفع البوت أدمن فيها وصحة المعرف."
 
         success = db.add_force_sub_channel(channel_text)
         ADMIN_STATES.pop(user_id, None)
 
         if success:
             await message.reply_text(
-                f"✅ تم إضافة القناة `{channel_text}` بنجاح!",
+                f"✅ تم إضافة القناة `{channel_text}` بنجاح!{warning_msg}",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للإعدادات", callback_data="admin_forcesub")]])
             )
         else:
@@ -413,11 +478,12 @@ async def process_admin_state_input(client: Client, message: Message):
 
     # 3. حالة إضافة قناة نشر عامة
     elif action == "waiting_add_public_channel":
-        channel_text = message.text.strip() if message.text else ""
-        if not channel_text:
+        raw_text = message.text.strip() if message.text else ""
+        if not raw_text:
             await message.reply_text("❌ يرجى إرسال يوزر القناة (مثال: `@mychannel`) أو رابطها أو آيدي القناة.")
             return
 
+        channel_text = sanitize_channel_input(raw_text)
         success = db.add_public_channel(channel_text)
         ADMIN_STATES.pop(user_id, None)
 
