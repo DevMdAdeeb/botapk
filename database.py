@@ -84,6 +84,12 @@ def init_db():
         conn.execute("""
             INSERT OR IGNORE INTO settings (key, value) VALUES ('force_sub_enabled', '0')
         """)
+        conn.execute("""
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('post_signature_text', '')
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('post_signature_url', '')
+        """)
 
         # إذا كانت هناك قناة سابقة مخزنة في الإعدادات القديمة، نحولها للجدول الجديد
         row = conn.execute("SELECT value FROM settings WHERE key = 'force_sub_channel'").fetchone()
@@ -198,7 +204,7 @@ def delete_file(file_id: int) -> bool:
         return cur.rowcount > 0
 
 
-# ---------- الإعدادات والاشتراك الإجباري ----------
+# ---------- الإعدادات والاشتراك الإجباري والتوقيع ----------
 
 def is_force_sub_enabled() -> bool:
     with get_conn() as conn:
@@ -241,6 +247,31 @@ def remove_force_sub_channel(channel: str) -> bool:
         cur = conn.execute("DELETE FROM force_sub_channels WHERE channel = ?", (channel.strip(),))
         conn.commit()
         return cur.rowcount > 0
+
+
+def get_post_signature() -> Tuple[str, str]:
+    """يرجع (text, url) التوقيع المخزن أو ("", "")."""
+    with get_conn() as conn:
+        row_text = conn.execute("SELECT value FROM settings WHERE key = 'post_signature_text'").fetchone()
+        row_url = conn.execute("SELECT value FROM settings WHERE key = 'post_signature_url'").fetchone()
+        text = row_text[0] if row_text and row_text[0] else ""
+        url = row_url[0] if row_url and row_url[0] else ""
+        return text, url
+
+
+def set_post_signature(text: str, url: str):
+    """يحدد نص ورابط التوقيع الخاص بالمنشورات."""
+    with get_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('post_signature_text', ?)", (text.strip(),))
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('post_signature_url', ?)", (url.strip(),))
+        conn.commit()
+
+
+def delete_post_signature():
+    """يحذف توقيع المنشورات."""
+    with get_conn() as conn:
+        conn.execute("UPDATE settings SET value = '' WHERE key IN ('post_signature_text', 'post_signature_url')")
+        conn.commit()
 
 
 # ---------- قنوات النشر العامة ----------
