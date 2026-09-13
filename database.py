@@ -1,6 +1,7 @@
 import sqlite3
+import json
 from contextlib import contextmanager
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 from config import DB_PATH
 
@@ -64,6 +65,18 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS public_channels (
                 channel TEXT PRIMARY KEY
+            )
+        """)
+
+        # جدول المنشورات المحفوظة بالأرقام
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_chat_id INTEGER NOT NULL,
+                post_message_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                extra_buttons TEXT, -- مخزنة كـ JSON string
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -167,6 +180,16 @@ def get_recent_files(limit: int = 10, offset: int = 0) -> List[Tuple[int, int, s
         return rows
 
 
+def get_top_downloaded_files(min_downloads: int = 10, limit: int = 20) -> List[Tuple[int, int, str, int, str]]:
+    """يرجع قائمة بأكثر التطبيقات تحميلاً التي بلغت أكثر من min_downloads تنزيل."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, storage_message_id, caption, downloads, created_at FROM files WHERE downloads > ? ORDER BY downloads DESC LIMIT ?",
+            (min_downloads, limit),
+        ).fetchall()
+        return rows
+
+
 def delete_file(file_id: int) -> bool:
     """يحذف ملفًا من قاعدة البيانات ويرجع True إذا تم الحذف."""
     with get_conn() as conn:
@@ -244,5 +267,61 @@ def remove_public_channel(channel: str) -> bool:
     """يحذف قناة من قنوات النشر العامة."""
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM public_channels WHERE channel = ?", (channel.strip(),))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+# ---------- المنشورات المحفوظة ----------
+
+def add_post(post_chat_id: int, post_message_id: int, file_id: int, extra_buttons: Optional[List[Dict[str, str]]] = None) -> int:
+    """يحفظ منشورًا تفاعليًا جديدًا ويرجع الـ ID الخاص بالمنشور."""
+    buttons_json = json.dumps(extra_buttons or [], ensure_ascii=False)
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO posts (post_chat_id, post_message_id, file_id, extra_buttons) VALUES (?, ?, ?, ?)",
+            (post_chat_id, post_message_id, file_id, buttons_json),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_post(post_id: int) -> Optional[Tuple[int, int, int, List[Dict[str, str]], str]]:
+    """يرجع (post_chat_id, post_message_id, file_id, extra_buttons, created_at) أو None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT post_chat_id, post_message_id, file_id, extra_buttons, created_at FROM posts WHERE id = ?",
+            (post_id,),
+        ).fetchone()
+        if not row:
+            return None
+        post_chat_id, post_message_id, file_id, extra_buttons_json, created_at = row
+        try:
+            extra_buttons = json.loads(extra_buttons_json) if extra_buttons_json else []
+        except Exception:
+            extra_buttons = []
+        return post_chat_id, post_message_id, file_id, extra_buttons, created_at
+
+
+def get_recent_posts(limit: int = 10, offset: int = 0) -> List[Tuple[int, int, int, int, str]]:
+    """يرجع قائمة بأحدث المنشورات."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, post_chat_id, post_message_id, file_id, created_at FROM posts ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        return rows
+
+
+def get_posts_count() -> int:
+    """يرجع عدد المنشورات المحفوظة."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT COUNT(*) FROM posts").fetchone()
+        return row[0] if row else 0
+
+
+def delete_post(post_id: int) -> bool:
+    """يحذف منشورًا من قاعدة البيانات."""
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
         conn.commit()
         return cur.rowcount > 0

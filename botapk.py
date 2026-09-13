@@ -1,6 +1,7 @@
 import logging
 import asyncio
-from typing import Dict, Any
+import re
+from typing import Dict, Any, List
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -45,6 +46,20 @@ def make_link(file_id: int) -> str:
     return f"https://t.me/{config.BOT_USERNAME}?start=file_{file_id}"
 
 
+def build_post_keyboard(download_link: str, extra_buttons: List[Dict[str, str]] = None) -> InlineKeyboardMarkup:
+    """يبني لوحة الأزرار الشفافة للمنشور شاملاً زر التحميل والأزرار الإضافية."""
+    rows = [
+        [InlineKeyboardButton("اضغط هنا للتحميل  📥", url=download_link)]
+    ]
+    if extra_buttons:
+        for btn in extra_buttons:
+            text = btn.get("text")
+            url = btn.get("url")
+            if text and url:
+                rows.append([InlineKeyboardButton(text, url=url)])
+    return InlineKeyboardMarkup(rows)
+
+
 # ---------------------------------------------------------------------------
 # لوحة تحكم الأدمن
 # ---------------------------------------------------------------------------
@@ -53,16 +68,18 @@ def get_admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📝 إنشاء منشور تطبيق", callback_data="admin_create_post_prompt"),
+            InlineKeyboardButton("📚 المنشورات المحفوظة", callback_data="admin_posts:0"),
         ],
         [
+            InlineKeyboardButton("🔥 الأعلى تحميلاً (>10)", callback_data="admin_top_downloads"),
             InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
+        ],
+        [
             InlineKeyboardButton("📢 الإذاعة العامة", callback_data="admin_broadcast_prompt"),
-        ],
-        [
             InlineKeyboardButton("🔐 الاشتراك الإجباري", callback_data="admin_forcesub"),
-            InlineKeyboardButton("📢 قنوات النشر العامة", callback_data="admin_public_channels"),
         ],
         [
+            InlineKeyboardButton("📢 قنوات النشر العامة", callback_data="admin_public_channels"),
             InlineKeyboardButton("📁 إدارة الملفات", callback_data="admin_files:0"),
         ],
         [
@@ -71,20 +88,8 @@ def get_admin_main_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def send_admin_panel(client: Client, chat_id: int):
-    stats_text = (
-        "🎛 **لوحة تحكم الأدمن**\n\n"
-        "مرحباً بك! اختر من الأزرار الشفافة أدناه للتحكم بكافة إعدادات البوت."
-    )
-    await client.send_message(
-        chat_id=chat_id,
-        text=stats_text,
-        reply_markup=get_admin_main_keyboard()
-    )
-
-
 # ---------------------------------------------------------------------------
-# التفاعل مع الرسائل الواردة (/start وغيره)
+# التفاعل مع الرسائل الواردة (/start والأوامر والنصوص)
 # ---------------------------------------------------------------------------
 
 @app.on_message(filters.private & filters.command("start"))
@@ -167,7 +172,6 @@ async def deliver_file(client: Client, chat_id: int, file_id: int, trigger_messa
 
 async def check_subscription(client: Client, user_id: int, channel: str) -> bool:
     try:
-        # التعامل مع المعرفات الرقمية أو اليوزرنيم
         ch_target = int(channel) if (channel.startswith("-100") or channel.isdigit()) else channel
         member = await client.get_chat_member(ch_target, user_id)
         return member.status not in ("left", "kicked", "banned")
@@ -239,7 +243,6 @@ async def check_sub_callback(client: Client, callback: CallbackQuery):
 async def admin_media_handler(client: Client, message: Message):
     user_id = message.from_user.id
 
-    # إذا كان الأدمن يمر بحالة تفاعلية معينة (إنشاء منشور / إرسال ملف / إذاعة...)
     if user_id in ADMIN_STATES:
         await process_admin_state_input(client, message)
         return
@@ -273,15 +276,29 @@ async def admin_media_handler(client: Client, message: Message):
 @app.on_message(filters.private & ~filters.command("start") & filters.user(config.ADMIN_IDS))
 async def admin_text_router(client: Client, message: Message):
     user_id = message.from_user.id
+    text = message.text.strip() if message.text else ""
+
+    # المعالجة الخاصة بالأوامر النسيجية: "معاينة X" أو "ارسال X"
+    if text.startswith("معاينة ") or text.startswith("معاينه "):
+        post_id_str = text.split(" ", 1)[1].strip()
+        if post_id_str.isdigit():
+            await preview_post_by_id(client, user_id, int(post_id_str))
+            return
+
+    if text.startswith("ارسال ") or text.startswith("إرسال "):
+        post_id_str = text.split(" ", 1)[1].strip()
+        if post_id_str.isdigit():
+            await publish_post_by_id(client, user_id, int(post_id_str))
+            return
+
     if user_id in ADMIN_STATES:
         await process_admin_state_input(client, message)
     else:
-        # إذا أرسل الأدمن رسالة نصية عادية غير معرفة، نعرض له زر لوحة التحكم
         buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("📝 إنشاء منشور تطبيق", callback_data="admin_create_post_prompt")],
             [InlineKeyboardButton("🎛 فتح لوحة التحكم", callback_data="admin_panel")]
         ])
-        await message.reply_text("🎛 يمكنك التحكم بالبوت أو إنشاء منشور عبر الخيارات التالية:", reply_markup=buttons)
+        await message.reply_text("🎛 يمكنك التحكم بالبوت أو تحرير المنشورات عبر الأزرار أدناه:", reply_markup=buttons)
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +318,8 @@ async def process_admin_state_input(client: Client, message: Message):
         ADMIN_STATES[user_id] = {
             "action": "waiting_app_file",
             "post_message_id": message.id,
-            "post_chat_id": message.chat.id
+            "post_chat_id": message.chat.id,
+            "extra_buttons": []
         }
 
         buttons = InlineKeyboardMarkup([
@@ -321,7 +339,6 @@ async def process_admin_state_input(client: Client, message: Message):
             await message.reply_text("❌ يرجى إرسال ملف التطبيق (ملف، فيديو، صوت، أو صورة) لربطه بالمنشور.")
             return
 
-        # حفظ الملف في قناة التخزين وقاعدة البيانات
         stored = await message.copy(chat_id=config.STORAGE_CHANNEL_ID)
         caption = message.caption or ""
         file_id = db.add_file(
@@ -330,47 +347,47 @@ async def process_admin_state_input(client: Client, message: Message):
             added_by=user_id,
         )
 
-        download_link = make_link(file_id)
-        post_msg_id = state_info["post_message_id"]
-        post_chat_id = state_info["post_chat_id"]
+        state_info["file_id"] = file_id
+        state_info["action"] = "waiting_extra_buttons_prompt"
 
-        # حفظ الحالة لانتظار تأكيد النشر
-        ADMIN_STATES[user_id] = {
-            "action": "confirm_publish_post",
-            "post_message_id": post_msg_id,
-            "post_chat_id": post_chat_id,
-            "file_id": file_id,
-            "download_link": download_link
-        }
-
-        # إنشاء الزر الشفاف للمنشور
-        download_btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("اضغط هنا للتحميل  📥", url=download_link)]
-        ])
-
-        # إرسال معاينة للمنشور النهائي للأدمن
-        await client.copy_message(
-            chat_id=user_id,
-            from_chat_id=post_chat_id,
-            message_id=post_msg_id,
-            reply_markup=download_btn
-        )
-
-        pub_channels = db.get_public_channels()
-        channels_count = len(pub_channels)
-
-        action_buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🚀 نشر في قنوات النشر", callback_data="post_publish_confirm"),
-                InlineKeyboardButton("❌ إلغاء", callback_data="post_cancel")
-            ]
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ إضافة زر خارجي", callback_data="post_add_button_prompt")],
+            [InlineKeyboardButton("➡️ المتابعة بدون أزرار إضافية", callback_data="post_finish_buttons")]
         ])
 
         await message.reply_text(
-            "✨ **هذه هي معاينة المنشور النهائية أعلاه.**\n\n"
-            f"📢 عدد قنوات النشر المحددة: `{channels_count}`\n"
-            "هل ترغب بنشر هذا المنشور الآن في قنوات النشر العامة؟",
-            reply_markup=action_buttons
+            "✅ **تم ربط التطبيق بنجاح!**\n\n"
+            "هل ترغب في إضافة أزرار خارجية إضافية للمنشور؟ (مثلاً: زر مشاهدة الشرح، رابط الموقع الرسمي...)",
+            reply_markup=buttons
+        )
+
+    # 1. تدفق إنشاء منشور التطبيق - الخطوة الثالثة: استقبال الزر الخارجي
+    elif action == "waiting_button_input":
+        text_input = message.text.strip() if message.text else ""
+        if "-" not in text_input or not (text_input.startswith("http://") or "http" in text_input):
+            await message.reply_text(
+                "❌ صيغة غير صحيحة! يرجى الإرسال بالشكل التالي:\n"
+                "`اسم الزر - https://example.com`"
+            )
+            return
+
+        parts = text_input.split("-", 1)
+        btn_text = parts[0].strip()
+        btn_url = parts[1].strip()
+
+        extra_buttons = state_info.get("extra_buttons", [])
+        extra_buttons.append({"text": btn_text, "url": btn_url})
+        state_info["extra_buttons"] = extra_buttons
+
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ إضافة زر آخر", callback_data="post_add_button_prompt")],
+            [InlineKeyboardButton("✅ الإنتهاء والمعاينة", callback_data="post_finish_buttons")]
+        ])
+
+        await message.reply_text(
+            f"✅ تم إضافة الزر: **[{btn_text}]({btn_url})**\n"
+            f"إجمالي الأزرار الإضافية: `{len(extra_buttons)}`",
+            reply_markup=buttons
         )
 
     # 2. حالة إضافة قناة اشتراك إجباري
@@ -474,6 +491,85 @@ async def process_admin_state_input(client: Client, message: Message):
 
 
 # ---------------------------------------------------------------------------
+# وظائف معاينة ونشر المنشورات بواسطة الـ ID
+# ---------------------------------------------------------------------------
+
+async def preview_post_by_id(client: Client, user_id: int, post_id: int):
+    post_row = db.get_post(post_id)
+    if not post_row:
+        await client.send_message(user_id, f"❌ لم يتم العثور على منشور بالرقم `{post_id}`")
+        return
+
+    post_chat_id, post_message_id, file_id, extra_buttons, created_at = post_row
+    download_link = make_link(file_id)
+    keyboard = build_post_keyboard(download_link, extra_buttons)
+
+    await client.send_message(user_id, f"📌 **معاينة المنشور رقم #{post_id}:**")
+    await client.copy_message(
+        chat_id=user_id,
+        from_chat_id=post_chat_id,
+        message_id=post_message_id,
+        reply_markup=keyboard
+    )
+
+    action_buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🚀 نشر المنشور #{post_id} في القنوات", callback_data=f"post_publish_saved:{post_id}")],
+        [InlineKeyboardButton("📚 قائمة المنشورات", callback_data="admin_posts:0")]
+    ])
+    await client.send_message(
+        user_id,
+        f"💡 لنشر هذا المنشور أرسل: `ارسال {post_id}` أو اضغط الزر أدناه:",
+        reply_markup=action_buttons
+    )
+
+
+async def publish_post_by_id(client: Client, user_id: int, post_id: int):
+    post_row = db.get_post(post_id)
+    if not post_row:
+        await client.send_message(user_id, f"❌ لم يتم العثور على منشور بالرقم `{post_id}`")
+        return
+
+    post_chat_id, post_message_id, file_id, extra_buttons, created_at = post_row
+    public_channels = db.get_public_channels()
+
+    if not public_channels:
+        await client.send_message(
+            user_id,
+            "⚠️ لا توجد قنوات نشر مضافة! أضف قنوات نشر من لوحة التحكم أولاً.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 قنوات النشر", callback_data="admin_public_channels")]])
+        )
+        return
+
+    download_link = make_link(file_id)
+    keyboard = build_post_keyboard(download_link, extra_buttons)
+
+    success_cnt = 0
+    failed_cnt = 0
+
+    for ch in public_channels:
+        try:
+            ch_target = int(ch) if (ch.startswith("-100") or ch.isdigit()) else ch
+            await client.copy_message(
+                chat_id=ch_target,
+                from_chat_id=post_chat_id,
+                message_id=post_message_id,
+                reply_markup=keyboard
+            )
+            success_cnt += 1
+        except Exception as e:
+            logger.error(f"Failed to publish post #{post_id} to {ch}: {e}")
+            failed_cnt += 1
+
+    report = (
+        f"🚀 **تم نشر المنشور رقم #{post_id} بنجاح!**\n\n"
+        f"✅ تم النشر في: `{success_cnt}` قناة\n"
+        f"❌ تعذر النشر في: `{failed_cnt}` قناة"
+    )
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="admin_panel")]])
+    await client.send_message(user_id, report, reply_markup=buttons)
+
+
+# ---------------------------------------------------------------------------
 # معالجة أزرار لوحة التحكم والتدفقات (Callback Queries)
 # ---------------------------------------------------------------------------
 
@@ -483,7 +579,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
     user_id = callback.from_user.id
 
     # إلغاء الحالات إذا لم تكن تفاعلية تابعة لعملية النشر أو الإذاعة الحالية
-    if not data.startswith("broadcast_confirm") and not data.startswith("post_publish_confirm"):
+    if not data.startswith("broadcast_confirm") and not data.startswith("post_publish_confirm") and not data.startswith("post_"):
         if data not in ("admin_broadcast_prompt", "admin_create_post_prompt"):
             ADMIN_STATES.pop(user_id, None)
 
@@ -495,7 +591,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
             reply_markup=get_admin_main_keyboard()
         )
 
-    # 2. بدء تدفق إنشاء منشور تطبيق
+    # 2. إنشاء منشور تطبيق
     elif data == "admin_create_post_prompt":
         ADMIN_STATES[user_id] = {"action": "waiting_post_content"}
         buttons = InlineKeyboardMarkup([
@@ -508,65 +604,151 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
             reply_markup=buttons
         )
 
+    elif data == "post_add_button_prompt":
+        state = ADMIN_STATES.get(user_id)
+        if state:
+            state["action"] = "waiting_button_input"
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ إلغاء والأكتفاء بالحالي", callback_data="post_finish_buttons")]
+            ])
+            await callback.message.edit_text(
+                "➕ **إضافة زر خارجي جديد:**\n\n"
+                "أرسل نص الزر ورابطه مفصولين بشرطة `-` بالشكل التالي:\n"
+                "`مشاهدة الشرح - https://youtube.com/watch?v=xxx`",
+                reply_markup=buttons
+            )
+
+    elif data == "post_finish_buttons":
+        state = ADMIN_STATES.get(user_id)
+        if not state or "file_id" not in state:
+            await callback.answer("حدث خطأ في الجلسة", show_alert=True)
+            return
+
+        file_id = state["file_id"]
+        post_msg_id = state["post_message_id"]
+        post_chat_id = state["post_chat_id"]
+        extra_buttons = state.get("extra_buttons", [])
+
+        # حفظ المنشور برقم تسلسلي في قاعدة البيانات
+        post_id = db.add_post(
+            post_chat_id=post_chat_id,
+            post_message_id=post_msg_id,
+            file_id=file_id,
+            extra_buttons=extra_buttons
+        )
+
+        download_link = make_link(file_id)
+        keyboard = build_post_keyboard(download_link, extra_buttons)
+
+        ADMIN_STATES[user_id] = {
+            "action": "confirm_publish_post",
+            "post_id": post_id,
+            "download_link": download_link
+        }
+
+        # إرسال المعاينة النهائية للمنشور
+        await client.copy_message(
+            chat_id=user_id,
+            from_chat_id=post_chat_id,
+            message_id=post_msg_id,
+            reply_markup=keyboard
+        )
+
+        pub_channels = db.get_public_channels()
+
+        action_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"🚀 نشر المنشور #{post_id} الآن", callback_data="post_publish_confirm"),
+                InlineKeyboardButton("❌ إغلاق", callback_data="post_cancel")
+            ]
+        ])
+
+        await callback.message.reply_text(
+            f"✨ **تم حفظ المنشور بنجاح تحت الرقم: #{post_id}**\n\n"
+            f"📌 يمكنك معاينته بأمر: `معاينة {post_id}`\n"
+            f"🚀 ويمكنك نشره بأمر: `ارسال {post_id}`\n\n"
+            f"📢 عدد قنوات النشر المحددة: `{len(pub_channels)}`\n"
+            "هل ترغب بنشره الآن في قنوات النشر العامة؟",
+            reply_markup=action_buttons
+        )
+
     elif data == "post_cancel":
         ADMIN_STATES.pop(user_id, None)
-        await callback.answer("تم إلغاء إنشاء المنشور")
+        await callback.answer("تم إلغاء المنشور")
         await callback.message.edit_text(
-            "❌ تم إلغاء إنشاء المنشور.",
+            "❌ تم إلغاء المنشور.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للوحة الرئيسي", callback_data="admin_panel")]])
         )
 
     elif data == "post_publish_confirm":
         state = ADMIN_STATES.pop(user_id, None)
-        if not state or state.get("action") != "confirm_publish_post":
+        if not state or "post_id" not in state:
             await callback.answer("انتهت صلاحية الجلسة أو حدث خطأ.", show_alert=True)
             return
 
-        post_msg_id = state["post_message_id"]
-        post_chat_id = state["post_chat_id"]
-        download_link = state["download_link"]
+        post_id = state["post_id"]
+        await publish_post_by_id(client, user_id, post_id)
 
-        public_channels = db.get_public_channels()
-        if not public_channels:
-            await callback.answer("⚠️ لا توجد قنوات نشر مضافة! يرجى إضافة قنوات نشر أولاً.", show_alert=True)
-            buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ إضافة قناة نشر", callback_data="public_add_prompt")],
-                [InlineKeyboardButton("🔙 العودة للوحة", callback_data="admin_panel")]
-            ])
-            await callback.message.edit_text("⚠️ **لم يتم النشر لعدم وجود قنوات نشر عامة مضافة.**", reply_markup=buttons)
-            return
+    elif data.startswith("post_publish_saved:"):
+        p_id = int(data.split("post_publish_saved:", 1)[1])
+        await publish_post_by_id(client, user_id, p_id)
 
-        download_btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("اضغط هنا للتحميل  📥", url=download_link)]
-        ])
+    # 3. المنشورات المحفوظة
+    elif data.startswith("admin_posts:"):
+        page = int(data.split("admin_posts:", 1)[1])
+        limit = 5
+        offset = page * limit
+        posts_list = db.get_recent_posts(limit=limit, offset=offset)
+        total_posts = db.get_posts_count()
 
-        success_cnt = 0
-        failed_cnt = 0
+        text = f"📚 **قائمة المنشورات المحفوظة** (الصفحة {page + 1}):\n\n"
+        buttons = []
 
-        for ch in public_channels:
-            try:
-                ch_target = int(ch) if (ch.startswith("-100") or ch.isdigit()) else ch
-                await client.copy_message(
-                    chat_id=ch_target,
-                    from_chat_id=post_chat_id,
-                    message_id=post_msg_id,
-                    reply_markup=download_btn
-                )
-                success_cnt += 1
-            except Exception as e:
-                logger.error(f"Failed to publish to {ch}: {e}")
-                failed_cnt += 1
+        if not posts_list:
+            text += "لا توجد منشورات محفوظة حالياً."
+        else:
+            for p_id, p_chat_id, p_msg_id, f_id, created_at in posts_list:
+                buttons.append([
+                    InlineKeyboardButton(f"📌 منشور #{p_id} (ملف #{f_id}) - {created_at[:10]}", callback_data=f"post_info:{p_id}")
+                ])
 
-        report = (
-            "🚀 **تم نشر المنشور في قنوات النشر العامة!**\n\n"
-            f"✅ القنوات التي تم النشر فيها: `{success_cnt}`\n"
-            f"❌ القنوات التي تعذر النشر فيها (تأكد من رفع البوت أدمن): `{failed_cnt}`"
-        )
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("◀️ السابقة", callback_data=f"admin_posts:{page - 1}"))
+        if offset + limit < total_posts:
+            nav_buttons.append(InlineKeyboardButton("التالية ▶️", callback_data=f"admin_posts:{page + 1}"))
 
-        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="admin_panel")]])
-        await callback.message.edit_text(report, reply_markup=buttons)
+        if nav_buttons:
+            buttons.append(nav_buttons)
 
-    # 3. إدارة قنوات النشر العامة
+        buttons.append([InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="admin_panel")])
+
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("post_info:"):
+        p_id = int(data.split("post_info:", 1)[1])
+        await preview_post_by_id(client, user_id, p_id)
+
+    # 4. الأعلى تحميلاً (> 10 مرات)
+    elif data == "admin_top_downloads":
+        top_files = db.get_top_downloaded_files(min_downloads=10, limit=20)
+
+        text = "🔥 **قائمة أكثر التطبيقات تحميلاً (أكثر من 10 مرات):**\n\n"
+        buttons = []
+
+        if not top_files:
+            text += "لا توجد تطبيقات بلغت أكثر من 10 تحميلات حتى الآن."
+        else:
+            for f_id, s_msg_id, cap, downloads, created_at in top_files:
+                short_cap = (cap[:20] + "...") if cap else "بدون عنوان"
+                buttons.append([
+                    InlineKeyboardButton(f"🔥 #{f_id} | {short_cap} ({downloads} 📥)", callback_data=f"file_info:{f_id}")
+                ])
+
+        buttons.append([InlineKeyboardButton("🔙 العودة للوحة الرئيسية", callback_data="admin_panel")])
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    # 5. إدارة قنوات النشر العامة
     elif data == "admin_public_channels":
         channels = db.get_public_channels()
         channels_str = "\n".join([f"• `{ch}`" for ch in channels]) if channels else "لا توجد قنوات نشر مضافة"
@@ -625,7 +807,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
         callback.data = "admin_public_channels"
         await admin_callbacks(client, callback)
 
-    # 4. الإحصائيات
+    # 6. الإحصائيات
     elif data == "admin_stats":
         users_cnt = db.get_users_count()
         files_cnt = db.get_files_count()
@@ -633,12 +815,14 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
         forcesub_status = "مفعّل ✅" if db.is_force_sub_enabled() else "معطل ❌"
         channels_cnt = len(db.get_force_sub_channels())
         public_channels_cnt = len(db.get_public_channels())
+        posts_cnt = db.get_posts_count()
 
         stats_text = (
             "📊 **إحصائيات البوت الشاملة:**\n\n"
             f"👤 عدد المستخدمين: `{users_cnt}`\n"
             f"📁 عدد الملفات المرفوعة: `{files_cnt}`\n"
             f"📥 إجمالي التحميلات: `{total_downloads}`\n"
+            f"📚 عدد المنشورات المحفوظة: `{posts_cnt}`\n"
             f"🔐 حالة الاشتراك الإجباري: {forcesub_status}\n"
             f"🔗 قنوات الاشتراك الإجباري: `{channels_cnt}`\n"
             f"📢 قنوات النشر العامة: `{public_channels_cnt}`\n"
@@ -649,7 +833,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
         ])
         await callback.message.edit_text(stats_text, reply_markup=buttons)
 
-    # 5. إدارة الاشتراك الإجباري
+    # 7. إدارة الاشتراك الإجباري
     elif data == "admin_forcesub":
         is_enabled = db.is_force_sub_enabled()
         channels = db.get_force_sub_channels()
@@ -724,7 +908,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
         callback.data = "admin_forcesub"
         await admin_callbacks(client, callback)
 
-    # 6. الإذاعة
+    # 8. الإذاعة
     elif data == "admin_broadcast_prompt":
         ADMIN_STATES[user_id] = {"action": "waiting_broadcast_msg"}
         buttons = InlineKeyboardMarkup([
@@ -787,7 +971,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 العودة للوحة", callback_data="admin_panel")]])
         await callback.message.edit_text(report, reply_markup=buttons)
 
-    # 7. إدارة الملفات
+    # 9. إدارة الملفات
     elif data.startswith("admin_files:"):
         page = int(data.split("admin_files:", 1)[1])
         limit = 5
@@ -861,7 +1045,7 @@ async def admin_callbacks(client: Client, callback: CallbackQuery):
             reply_markup=buttons
         )
 
-    # 8. إغلاق اللوحة
+    # 10. إغلاق اللوحة
     elif data == "admin_close":
         await callback.message.delete()
 
